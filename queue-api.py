@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import psycopg2
+import psycopg2.extras
 import os
 
 app = FastAPI(title="ExpertIQ Queue API")
@@ -104,3 +105,4 @@ def update_job(job: Job):
     cur.close()
     conn.close()
     return {"message": "Job updated", "id": job.id, "status": job.status}
+

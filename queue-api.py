@@ -1,73 +1,106 @@
-from fastapi import FastAPI, Request
-import psycopg2, os, json
-from psycopg2.extras import RealDictCursor
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import psycopg2
+import os
 
-app = FastAPI()
+app = FastAPI(title="ExpertIQ Queue API")
 
+# Hent Render-database-URL fra environment
 DATABASE_URL = os.getenv("DATABASE_URL")
-conn = psycopg2.connect(DATABASE_URL, sslmode="require", cursor_factory=RealDictCursor)
 
+# ----------------------------------------------------
+# Databasehjelpere
+# ----------------------------------------------------
+def get_connection():
+    return psycopg2.connect(DATABASE_URL)
+
+def init_db():
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS jobs (
+            id SERIAL PRIMARY KEY,
+            payload JSONB,
+            status TEXT DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        );
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
+
+# Kjør init ved oppstart
+init_db()
+
+# ----------------------------------------------------
+# Datamodeller
+# ----------------------------------------------------
+class Job(BaseModel):
+    id: int | None = None
+    payload: dict | None = None
+    status: str | None = None
+
+# ----------------------------------------------------
+# API-ruter
+# ----------------------------------------------------
+@app.get("/")
+def root():
+    return {"message": "ExpertIQ Queue API is live!"}
+
+@app.get("/health")
+def health():
+    try:
+        conn = get_connection()
+        conn.close()
+        return {"status": "ok", "db": "connected"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 @app.post("/add")
-async def add_job(request: Request):
-    data = await request.json()
-    with conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO queue_das (file_url, box_id, status)
-            VALUES (%s, %s, 'pending')
-            RETURNING id;
-            """,
-            (data.get("file_url"), data.get("box_id", "unknown")),
-        )
-        job_id = cur.fetchone()["id"]
-    return {"status": "ok", "id": job_id}
-
+def add_job(job: Job):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO jobs (payload, status) VALUES (%s, %s) RETURNING id;",
+                (psycopg2.extras.Json(job.payload), "pending"))
+    new_id = cur.fetchone()[0]
+    conn.commit()
+    cur.close()
+    conn.close()
+    return {"message": "Job added", "id": new_id}
 
 @app.get("/next")
-async def get_next_job():
-    with conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            UPDATE queue_das
-            SET status='processing'
-            WHERE id = (
-                SELECT id FROM queue_das WHERE status='pending'
-                ORDER BY id ASC
-                LIMIT 1
-            )
-            RETURNING id, file_url, box_id;
-            """
-        )
-        job = cur.fetchone()
-    return {"job": job}
-
+def get_next_job():
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, payload FROM jobs
+        WHERE status = 'pending'
+        ORDER BY created_at ASC
+        LIMIT 1;
+    """)
+    row = cur.fetchone()
+    if not row:
+        cur.close()
+        conn.close()
+        return {"job": None}
+    job_id, payload = row
+    # Sett status til "processing"
+    cur.execute("UPDATE jobs SET status = 'processing', updated_at = NOW() WHERE id = %s;", (job_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+    return {"job": {"id": job_id, "payload": payload}}
 
 @app.post("/update")
-async def update_job(request: Request):
-    data = await request.json()
-    with conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            UPDATE queue_das
-            SET status=%s, updated_at=NOW(), last_error=%s
-            WHERE id=%s;
-            """,
-            (data.get("status", "done"), data.get("error", None), data["id"]),
-        )
-    return {"status": "updated", "id": data["id"]}
-
-
-@app.get("/stats")
-async def get_stats():
-    with conn, conn.cursor() as cur:
-        cur.execute("""
-            SELECT
-              COUNT(*) FILTER (WHERE status='pending') AS pending,
-              COUNT(*) FILTER (WHERE status='processing') AS processing,
-              COUNT(*) FILTER (WHERE status='done') AS done,
-              COUNT(*) FILTER (WHERE status='failed') AS failed
-            FROM queue_das;
-        """)
-        stats = cur.fetchone()
-    return {"queue_stats": stats}
+def update_job(job: Job):
+    if not job.id:
+        raise HTTPException(status_code=400, detail="Missing job ID")
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE jobs SET status = %s, updated_at = NOW() WHERE id = %s;",
+                (job.status or "done", job.id))
+    conn.commit()
+    cur.close()
+    conn.close()
+    return {"message": "Job updated", "id": job.id, "status": job.status}
